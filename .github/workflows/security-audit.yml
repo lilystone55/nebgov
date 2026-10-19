@@ -1,0 +1,112 @@
+name: Security Audit
+
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - '.github/workflows/security-audit.yml'
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  push:
+    branches:
+      - main
+
+jobs:
+  cargo-audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit
+        id: audit
+        run: |
+          cargo audit --json > audit-report.json 2>&1 || true
+          cat audit-report.json
+
+      - name: Comment PR with audit results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            try {
+              const auditReport = JSON.parse(fs.readFileSync('audit-report.json', 'utf8'));
+              
+              if (auditReport.vulnerabilities && auditReport.vulnerabilities.vulnerabilities && auditReport.vulnerabilities.vulnerabilities.length > 0) {
+                const vulns = auditReport.vulnerabilities.vulnerabilities;
+                let comment = '## ⚠️ Security Audit Results\n\n';
+                comment += `Found **${vulns.length}** vulnerable dependencies:\n\n`;
+                
+                vulns.forEach(vuln => {
+                  comment += `### ${vuln.package.name} v${vuln.package.version}\n`;
+                  comment += `- **Advisory ID:** ${vuln.advisory.id}\n`;
+                  comment += `- **Title:** ${vuln.advisory.title}\n`;
+                  comment += `- **Severity:** ${vuln.advisory.severity}\n`;
+                  comment += `- **Description:** ${vuln.advisory.description}\n\n`;
+                });
+                
+                comment += '**Action Required:** Please update vulnerable dependencies or apply patches.\n';
+                
+                github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: comment
+                });
+              } else {
+                github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: '✅ Security audit passed - no known vulnerabilities detected.'
+                });
+              }
+            } catch (error) {
+              console.error('Error processing audit results:', error);
+            }
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: cargo-audit-report
+          path: audit-report.json
+          retention-days: 30
